@@ -1,0 +1,2 @@
+# EntraID-get-licensed-users
+ 
