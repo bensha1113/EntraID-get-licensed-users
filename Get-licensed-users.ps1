@@ -748,17 +748,49 @@ if ($signInEvaluationEnabled) {
         $filterTimestamp = $logSince.ToUniversalTime().ToString("o")
         Write-Host "Retrieving sign-in logs since $filterTimestamp..." -ForegroundColor Cyan
         try {
-                $signInLogs = Get-MgAuditLogSignIn -All -Filter "createdDateTime ge $filterTimestamp" -Property userPrincipalName,createdDateTime
-                foreach ($entry in $signInLogs) {
-                        $upn = $entry.UserPrincipalName
-                        if ([string]::IsNullOrWhiteSpace($upn)) { continue }
-                        if (-not $entry.CreatedDateTime) { continue }
-                        $entryTime = [datetime]$entry.CreatedDateTime
-                        if (-not $signInLookup.ContainsKey($upn) -or $signInLookup[$upn] -lt $entryTime) {
-                                $signInLookup[$upn] = $entryTime
+                # Large single-window queries are prone to HttpClient timeouts, so slice the
+                # lookback period into smaller chunks that the Graph service can fulfill quickly.
+                $chunkDays = 30
+                $chunkStart = $logSince
+                $chunkEndCap = Get-Date
+                $totalEvents = 0
+                $totalChunks = 0
+                while ($chunkStart -lt $chunkEndCap) {
+                        $chunkEnd = $chunkStart.AddDays($chunkDays)
+                        if ($chunkEnd -gt $chunkEndCap) { $chunkEnd = $chunkEndCap }
+                        $chunkFilter = "createdDateTime ge $($chunkStart.ToUniversalTime().ToString('o')) and createdDateTime lt $($chunkEnd.ToUniversalTime().ToString('o'))"
+                        $chunkLabel = "$(($chunkStart.ToUniversalTime()).ToString('yyyy-MM-dd')) -> $(($chunkEnd.ToUniversalTime()).ToString('yyyy-MM-dd'))"
+                        Write-Host "  Fetching sign-ins for $chunkLabel" -ForegroundColor DarkGray
+                        $chunkAttempt = 0
+                        while ($true) {
+                                try {
+                                        $chunkLogs = Get-MgAuditLogSignIn -All -PageSize 200 -Filter $chunkFilter -Property userPrincipalName,createdDateTime -ErrorAction Stop
+                                        break
+                                }
+                                catch {
+                                        $chunkAttempt++
+                                        if ($chunkAttempt -ge 3) { throw }
+                                        $retryDelay = [math]::Min(5 * $chunkAttempt, 15)
+                                        Write-Warning "Sign-in chunk $chunkLabel failed (attempt $chunkAttempt). Retrying in $retryDelay seconds..."
+                                        Start-Sleep -Seconds $retryDelay
+                                }
                         }
+                        $chunkCount = 0
+                        foreach ($entry in $chunkLogs) {
+                                $upn = $entry.UserPrincipalName
+                                if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+                                if (-not $entry.CreatedDateTime) { continue }
+                                $entryTime = [datetime]$entry.CreatedDateTime
+                                if (-not $signInLookup.ContainsKey($upn) -or $signInLookup[$upn] -lt $entryTime) {
+                                        $signInLookup[$upn] = $entryTime
+                                }
+                                $chunkCount++
+                        }
+                        $totalEvents += $chunkCount
+                        $totalChunks++
+                        $chunkStart = $chunkEnd
                 }
-                Write-Host "Captured sign-in timestamps for $($signInLookup.Count) users" -ForegroundColor Cyan
+                Write-Host "Captured sign-in timestamps for $($signInLookup.Count) users ($totalEvents events across $totalChunks requests)" -ForegroundColor Cyan
         }
         catch {
                 Write-Warning "Could not retrieve sign-in logs: $_"
